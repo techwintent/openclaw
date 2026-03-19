@@ -1,0 +1,15 @@
+{
+  "name": "@openclaw/wintent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw Wintent clothing store tools — sales, inventory, reports via NocoBase",
+  "type": "module",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -505,6 +505,10 @@
       "types": "./dist/plugin-sdk/web-media.d.ts",
       "default": "./dist/plugin-sdk/web-media.js"
     },
+    "./plugin-sdk/wintent": {
+      "types": "./dist/plugin-sdk/wintent.d.ts",
+      "default": "./dist/plugin-sdk/wintent.js"
+    },
     "./plugin-sdk/zai": {
       "types": "./dist/plugin-sdk/zai.d.ts",
       "default": "./dist/plugin-sdk/zai.js"

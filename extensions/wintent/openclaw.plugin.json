@@ -1,0 +1,10 @@
+{
+  "id": "wintent",
+  "name": "Wintent Store",
+  "description": "Retail store management tools for Wintent Chat: sales, inventory, and reports via NocoBase.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
