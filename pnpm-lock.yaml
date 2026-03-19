@@ -602,6 +602,12 @@ importers:
 
   extensions/zai: {}
 
+  extensions/wintent:
+    dependencies:
+      '@sinclair/typebox':
+        specifier: 0.34.48
+        version: 0.34.48
+
   extensions/zalo:
     dependencies:
       undici:
