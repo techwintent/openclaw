@@ -1064,6 +1064,10 @@
       "types": "./dist/plugin-sdk/tool-payload.d.ts",
       "default": "./dist/plugin-sdk/tool-payload.js"
     },
+    "./plugin-sdk/wintent": {
+      "types": "./dist/plugin-sdk/wintent.d.ts",
+      "default": "./dist/plugin-sdk/wintent.js"
+    },
     "./plugin-sdk/tool-send": {
       "types": "./dist/plugin-sdk/tool-send.d.ts",
       "default": "./dist/plugin-sdk/tool-send.js"
