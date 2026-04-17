@@ -6,7 +6,7 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { optionalStringEnum, stringEnum } from "openclaw/plugin-sdk/core";
+import { optionalStringEnum } from "openclaw/plugin-sdk/core";
 
 // ─── Sales Tool Schemas ───
 
@@ -82,33 +82,6 @@ export const BusinessOverviewSchema = Type.Object(
     description:
       "Generate a comprehensive business overview including sales, inventory status, and key metrics",
   },
-);
-
-// ─── Kanban Tool Schemas (Phase 4) ───
-
-export const ShowKanbanSchema = Type.Object(
-  {
-    project_id: Type.Optional(
-      Type.Integer({ description: "Filter by project ID. If omitted, shows all projects." }),
-    ),
-    plan_id: Type.Optional(
-      Type.Integer({ description: "Filter by plan ID. If omitted, shows all plans." }),
-    ),
-    status_filter: optionalStringEnum(["pending", "in_progress", "completed"] as const, {
-      description: "Filter tasks by status: pending, in_progress, completed",
-    }),
-  },
-  { description: "Show kanban board with projects, plans, and tasks hierarchy" },
-);
-
-export const UpdateTaskStatusSchema = Type.Object(
-  {
-    task_id: Type.Integer({ description: "The ID of the task to update" }),
-    new_status: stringEnum(["pending", "in_progress", "completed"] as const, {
-      description: "New status: pending, in_progress, or completed",
-    }),
-  },
-  { description: "Update a kanban task status" },
 );
 
 // ─── Methodology Tool Schemas (Phase 4) ───

@@ -1,6 +1,6 @@
 ---
 name: wintent_store
-description: Wintent clothing store management — sales, inventory, reports, kanban, and methodology
+description: Wintent clothing store management — sales, inventory, reports, and methodology
 ---
 
 # Wintent 服装店运营助手
@@ -23,11 +23,6 @@ description: Wintent clothing store management — sales, inventory, reports, ka
 
 - **sales_report**: 生成销售报表。可指定日期范围和汇总维度（day/week/month）。
 - **business_overview**: 生成经营概览，包含销售、库存、关键指标等综合数据。
-
-### 项目看板
-
-- **show_kanban**: 显示项目看板，包含项目、计划、任务的层级视图和进度统计。可选参数：project_id（指定项目）、plan_id（指定计划）、status_filter（按状态筛选）。
-- **update_task_status**: 更新看板任务状态。需要：task_id（任务ID）、new_status（新状态：pending/in_progress/completed）。
 
 ### 经营方法论
 

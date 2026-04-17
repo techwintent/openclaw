@@ -38,8 +38,8 @@
     },
     "install": {
       "npmSpec": "@openclaw/tlon",
-      "defaultChoice": "npm",
-      "minHostVersion": ">=2026.4.10"
+      "localPath": "extensions/tlon",
+      "defaultChoice": "npm"
     }
   }
 }

@@ -11,12 +11,45 @@
  */
 
 const NOCOBASE_URL = process.env.NOCOBASE_API_URL || "http://nocobase:13000";
-const NOCOBASE_TOKEN = process.env.NOCOBASE_API_TOKEN || "";
+const NOCOBASE_ACCOUNT = process.env.NOCOBASE_ACCOUNT || "nocobase";
+const NOCOBASE_PASSWORD = process.env.NOCOBASE_PASSWORD || "admin123";
 
 type NocoBaseResponse<T = unknown> = {
   data: T;
   meta?: { count?: number; page?: number; pageSize?: number };
 };
+
+/** Cached auth token with expiry */
+let cachedToken = process.env.NOCOBASE_API_TOKEN || "";
+let tokenExpiresAt = 0;
+
+/** Sign in to NocoBase and cache the token */
+async function ensureToken(): Promise<string> {
+  if (cachedToken && (tokenExpiresAt === 0 || Date.now() < tokenExpiresAt)) {
+    return cachedToken;
+  }
+
+  const res = await fetch(`${NOCOBASE_URL}/api/auth:signIn`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account: NOCOBASE_ACCOUNT, password: NOCOBASE_PASSWORD }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`NocoBase auth failed: ${res.status}`);
+  }
+
+  const body = (await res.json()) as { data?: { token?: string } };
+  const token = body?.data?.token;
+  if (!token) {
+    throw new Error("NocoBase auth: no token in response");
+  }
+
+  cachedToken = token;
+  // Refresh 20 minutes before expiry (JWT default is usually 24h)
+  tokenExpiresAt = Date.now() + 23 * 60 * 60 * 1000;
+  return cachedToken;
+}
 
 /** Make a request to NocoBase REST API */
 async function nbFetch<T = unknown>(
@@ -37,18 +70,30 @@ async function nbFetch<T = unknown>(
     }
   }
 
+  const token = await ensureToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
   };
-  if (NOCOBASE_TOKEN) {
-    headers.Authorization = `Bearer ${NOCOBASE_TOKEN}`;
-  }
 
-  const response = await fetch(url.toString(), {
+  let response = await fetch(url.toString(), {
     method: options.method || "GET",
     headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
+
+  // If 401, token might have expired — refresh and retry once
+  if (response.status === 401) {
+    cachedToken = "";
+    tokenExpiresAt = 0;
+    const newToken = await ensureToken();
+    headers.Authorization = `Bearer ${newToken}`;
+    response = await fetch(url.toString(), {
+      method: options.method || "GET",
+      headers,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+  }
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "Unknown error");
@@ -115,7 +160,7 @@ export async function querySales(params?: {
     filter.saleDate = { $gte: params.start_date };
   }
   if (params?.end_date) {
-    filter.saleDate = { ...((filter.saleDate as object) || {}), $lte: params.end_date };
+    filter.saleDate = { ...(filter.saleDate as object), $lte: params.end_date };
   }
   if (params?.product_name) {
     filter.productName = { $includes: params.product_name };
@@ -204,127 +249,6 @@ export async function checkLowStock() {
   };
 }
 
-// ─── Kanban (Phase 4) ───
-// NocoBase fields: name, description, status, archived (projects), projectId (plans), planId (tasks)
-
-export interface KanbanProject {
-  id: number;
-  name: string;
-  description?: string;
-  status: string;
-  archived?: boolean;
-  created_at?: string;
-}
-
-export interface KanbanPlan {
-  id: number;
-  name: string;
-  description?: string;
-  project_id: number;
-  status: string;
-  created_at?: string;
-}
-
-export interface KanbanTask {
-  id: number;
-  name: string;
-  description?: string;
-  plan_id: number;
-  status: string;
-  assignee?: string;
-  due_date?: string;
-  estimated_hours?: number;
-  created_at?: string;
-}
-
-/** List kanban projects */
-export async function listKanbanProjects(projectId?: number) {
-  const filter: Record<string, unknown> = {};
-  if (projectId) filter.id = projectId;
-  const result = await nbFetch<Record<string, unknown>[]>("/kanban_projects:list", {
-    params: {
-      filter: JSON.stringify(filter),
-      pageSize: "50",
-    },
-  });
-  return {
-    data: (result.data || []).map(
-      (nb): KanbanProject => ({
-        id: nb.id as number,
-        name: nb.name as string,
-        description: nb.description as string,
-        status: nb.status as string,
-        archived: nb.archived as boolean,
-        created_at: nb.createdAt as string,
-      }),
-    ),
-    meta: result.meta,
-  };
-}
-
-/** List kanban plans for a project */
-export async function listKanbanPlans(projectId?: number, planId?: number) {
-  const filter: Record<string, unknown> = {};
-  if (projectId) filter.projectId = projectId;
-  if (planId) filter.id = planId;
-  const result = await nbFetch<Record<string, unknown>[]>("/kanban_plans:list", {
-    params: {
-      filter: JSON.stringify(filter),
-      pageSize: "50",
-    },
-  });
-  return {
-    data: (result.data || []).map(
-      (nb): KanbanPlan => ({
-        id: nb.id as number,
-        name: nb.name as string,
-        description: nb.description as string,
-        project_id: (nb.projectId as number) || 0,
-        status: nb.status as string,
-        created_at: nb.createdAt as string,
-      }),
-    ),
-    meta: result.meta,
-  };
-}
-
-/** List kanban tasks for a plan */
-export async function listKanbanTasks(planId?: number, statusFilter?: string) {
-  const filter: Record<string, unknown> = {};
-  if (planId) filter.planId = planId;
-  if (statusFilter) filter.status = statusFilter;
-  const result = await nbFetch<Record<string, unknown>[]>("/kanban_tasks:list", {
-    params: {
-      filter: JSON.stringify(filter),
-      pageSize: "200",
-    },
-  });
-  return {
-    data: (result.data || []).map(
-      (nb): KanbanTask => ({
-        id: nb.id as number,
-        name: nb.name as string,
-        description: nb.description as string,
-        plan_id: (nb.planId as number) || 0,
-        status: nb.status as string,
-        assignee: nb.assignee as string,
-        due_date: nb.dueDate as string,
-        estimated_hours: nb.estimatedHours as number,
-        created_at: nb.createdAt as string,
-      }),
-    ),
-    meta: result.meta,
-  };
-}
-
-/** Update a kanban task's status */
-export async function updateKanbanTaskStatus(taskId: number, newStatus: string) {
-  return nbFetch<KanbanTask>(`/kanban_tasks:update/${taskId}`, {
-    method: "POST",
-    body: { status: newStatus },
-  });
-}
-
 // ─── Methodology Templates (Phase 4) ───
 
 export interface MethodologyTemplate {
@@ -347,8 +271,12 @@ export interface MethodologyTemplate {
 /** List methodology templates */
 export async function listMethodologyTemplates(params?: { category?: string; industry?: string }) {
   const filter: Record<string, unknown> = {};
-  if (params?.category) filter.category = params.category;
-  if (params?.industry) filter.industry = { $includes: params.industry };
+  if (params?.category) {
+    filter.category = params.category;
+  }
+  if (params?.industry) {
+    filter.industry = { $includes: params.industry };
+  }
   return nbFetch<MethodologyTemplate[]>("/methodology_templates:list", {
     params: {
       filter: JSON.stringify(filter),
@@ -413,7 +341,7 @@ export async function generateSalesReport(params?: {
   }
   const topProducts = Array.from(productMap.entries())
     .map(([product_name, stats]) => ({ product_name, ...stats }))
-    .sort((a, b) => b.revenue - a.revenue)
+    .toSorted((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
 
   const dayMap = new Map<string, { revenue: number; orders: number }>();
@@ -426,7 +354,7 @@ export async function generateSalesReport(params?: {
   }
   const dailySales = Array.from(dayMap.entries())
     .map(([date, stats]) => ({ date, ...stats }))
-    .sort((a, b) => a.date.localeCompare(b.date));
+    .toSorted((a, b) => a.date.localeCompare(b.date));
 
   return {
     data: {

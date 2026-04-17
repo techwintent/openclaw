@@ -1,465 +1,254 @@
 /**
  * Wintent OpenClaw Extension
  *
- * Registers clothing store management tools:
- * - create_sale: Create a new sales record
- * - query_sales: Query sales records
- * - query_inventory: Query product inventory
- * - check_low_stock: Check for low stock items
- * - sales_report: Generate sales report
- * - business_overview: Generate business overview
- * - confirm_action: Ask user to confirm an action
+ * Architecture: OpenClaw is the SOLE AI entry point.
+ * - Business tools (sales, inventory, reports, methodology) are passed
+ *   via the `tools` parameter in the Responses API request from chat-web.
+ *   OpenClaw forwards them to MiniMax, which uses native function calling.
+ *   Since no server-side handler is registered, OpenClaw emits function_call
+ *   events in the SSE stream → frontend renders ToolUI cards.
+ * - Cron/scheduling tools are registered here with server-side handlers
+ *   (executed by OpenClaw against NocoBase, no card rendering needed).
  */
 
-import type { Static } from "@sinclair/typebox";
-import type { AnyAgentTool, OpenClawPluginApi, PluginLogger } from "openclaw/plugin-sdk/core";
-import {
-  createSale,
-  querySales,
-  queryInventory,
-  checkLowStock,
-  generateSalesReport,
-  generateBusinessOverview,
-  listKanbanProjects,
-  listKanbanPlans,
-  listKanbanTasks,
-  updateKanbanTaskStatus,
-  listMethodologyTemplates,
-  getMethodologyTemplate,
-} from "./src/nocobase-client.js";
-import {
-  CreateSaleSchema,
-  QuerySalesSchema,
-  QueryInventorySchema,
-  CheckLowStockSchema,
-  SalesReportSchema,
-  BusinessOverviewSchema,
-  ConfirmActionSchema,
-  ShowKanbanSchema,
-  UpdateTaskStatusSchema,
-  ListMethodologiesSchema,
-  ShowMethodologySchema,
-} from "./src/schemas.js";
+import type { OpenClawPluginApi, PluginLogger } from "openclaw/plugin-sdk/core";
 
-type CreateSaleParams = Static<typeof CreateSaleSchema>;
-type QuerySalesParams = Static<typeof QuerySalesSchema>;
-type QueryInventoryParams = Static<typeof QueryInventorySchema>;
-type SalesReportParams = Static<typeof SalesReportSchema>;
-type ConfirmActionParams = Static<typeof ConfirmActionSchema>;
-type ShowKanbanParams = Static<typeof ShowKanbanSchema>;
-type UpdateTaskStatusParams = Static<typeof UpdateTaskStatusSchema>;
-type ListMethodologiesParams = Static<typeof ListMethodologiesSchema>;
-type ShowMethodologyParams = Static<typeof ShowMethodologySchema>;
+type AnyAgentTool = ReturnType<
+  Extract<Parameters<OpenClawPluginApi["registerTool"]>[0], (...args: unknown[]) => unknown>
+>;
 
-function json(data: unknown) {
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
-    details: data,
-  };
-}
-
-function errorResult(message: string) {
-  return {
-    content: [{ type: "text" as const, text: `Error: ${message}` }],
-    details: { error: message },
-  };
+function json(data: unknown): string {
+  return JSON.stringify(data, null, 2);
 }
 
 export default function register(api: OpenClawPluginApi) {
   const log: PluginLogger = api.logger;
 
-  // ─── BE1: Sales Tools ───
+  log.info(
+    "[wintent] Extension loaded. Business tools are client-rendered (passed via API tools param).",
+  );
+  log.info("[wintent] Registering server-side cron/scheduling tools...");
 
+  // ─── Cron / Scheduling Tools (server-side execution) ───
+  // These tools allow the AI to create, list, and manage scheduled tasks.
+  // Cron configs are stored in NocoBase `scheduled_tasks` collection.
+  // Execution is handled by OpenClaw's built-in cron infrastructure.
+
+  const NOCOBASE_URL = process.env.NOCOBASE_API_URL || "http://nocobase:13000";
+
+  async function getToken(): Promise<string> {
+    const envToken = process.env.NOCOBASE_API_TOKEN;
+    if (envToken) {
+      return envToken;
+    }
+    const res = await fetch(`${NOCOBASE_URL}/api/auth:signIn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account: "nocobase", password: "admin123" }),
+    });
+    if (!res.ok) {
+      throw new Error(`NocoBase auth failed: ${res.status}`);
+    }
+    const body = (await res.json()) as { data: { token: string } };
+    return body.data.token;
+  }
+
+  async function nbFetch<T>(path: string, opts: RequestInit = {}): Promise<T> {
+    const token = await getToken();
+    const res = await fetch(`${NOCOBASE_URL}${path}`, {
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        ...(opts.headers as Record<string, string>),
+      },
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`NocoBase ${path} → ${res.status}: ${text}`);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  // ── create_scheduled_task ──
   api.registerTool(
     () =>
       ({
-        name: "create_sale",
-        label: "Create Sale",
+        name: "create_scheduled_task",
+        label: "Create Scheduled Task",
         description:
-          "Create a new sales record in the system. Use this when the user wants to record a sale or transaction.",
-        parameters: CreateSaleSchema,
-        async execute(_toolCallId: string, params: CreateSaleParams) {
-          log.info(`[wintent] create_sale: ${JSON.stringify(params)}`);
-          try {
-            const result = await createSale(params);
-            return json({
-              success: true,
-              message: "Sale created successfully",
-              sale: result.data,
-            });
-          } catch (err) {
-            log.error(`[wintent] create_sale error: ${err}`);
-            return errorResult(
-              `Failed to create sale: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
+          "Create a recurring scheduled task. Supports cron expressions (e.g. '0 9 * * *' for daily 9AM) or simple intervals ('every 1h', 'every 30m'). Tasks can trigger tool executions like daily low-stock alerts, weekly sales reports, etc.",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            name: { type: "string", description: "Human-readable name for the task" },
+            description: { type: "string", description: "What this task does" },
+            cron_expression: {
+              type: "string",
+              description:
+                "Cron expression (e.g. '0 9 * * *' = daily 9AM, '0 0 * * 1' = weekly Monday). Use standard 5-field cron format.",
+            },
+            tool_name: {
+              type: "string",
+              description:
+                "The tool to execute on schedule (e.g. check_low_stock, sales_report, business_overview)",
+            },
+            tool_args: {
+              type: "object",
+              description: "Arguments to pass to the tool when executed",
+            },
+            enabled: {
+              type: "boolean",
+              description: "Whether the task is active (default: true)",
+            },
+          },
+          required: ["name", "cron_expression", "tool_name"],
         },
-      }) as unknown as AnyAgentTool,
-    { optional: true },
-  );
-
-  api.registerTool(
-    () =>
-      ({
-        name: "query_sales",
-        label: "Query Sales",
-        description: "Query sales records with optional date range and product name filters.",
-        parameters: QuerySalesSchema,
-        async execute(_toolCallId: string, params: QuerySalesParams) {
-          log.info(`[wintent] query_sales: ${JSON.stringify(params)}`);
-          try {
-            const result = await querySales(params);
-            return json({
-              sales: result.data,
-              total: result.meta?.count ?? result.data?.length ?? 0,
-            });
-          } catch (err) {
-            log.error(`[wintent] query_sales error: ${err}`);
-            return errorResult(
-              `Failed to query sales: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        },
-      }) as unknown as AnyAgentTool,
-    { optional: true },
-  );
-
-  // ─── BE2: Inventory Tools ───
-
-  api.registerTool(
-    () =>
-      ({
-        name: "query_inventory",
-        label: "Query Inventory",
-        description: "Query current product inventory and stock levels.",
-        parameters: QueryInventorySchema,
-        async execute(_toolCallId: string, params: QueryInventoryParams) {
-          log.info(`[wintent] query_inventory: ${JSON.stringify(params)}`);
-          try {
-            const result = await queryInventory(params);
-            return json({
-              items: result.data,
-              total: result.meta?.count ?? result.data?.length ?? 0,
-            });
-          } catch (err) {
-            log.error(`[wintent] query_inventory error: ${err}`);
-            return errorResult(
-              `Failed to query inventory: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        },
-      }) as unknown as AnyAgentTool,
-    { optional: true },
-  );
-
-  api.registerTool(
-    () =>
-      ({
-        name: "check_low_stock",
-        label: "Check Low Stock",
-        description: "Check for products with low stock levels that may need restocking.",
-        parameters: CheckLowStockSchema,
-        async execute(_toolCallId: string) {
-          log.info("[wintent] check_low_stock");
-          try {
-            const result = await checkLowStock();
-            const items = result.data || [];
-            return json({
-              low_stock_items: items.map((item) => ({
-                product_name: item.product_name,
-                sku: item.sku,
-                category: item.category,
-                current_stock: item.quantity,
-                min_stock: item.min_stock || 10,
-                needs_restock: item.quantity <= (item.min_stock || 10),
-              })),
-              total: items.length,
-              alert:
-                items.length > 0
-                  ? `${items.length} products have low stock`
-                  : "All products are well stocked",
-            });
-          } catch (err) {
-            log.error(`[wintent] check_low_stock error: ${err}`);
-            return errorResult(
-              `Failed to check low stock: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        },
-      }) as unknown as AnyAgentTool,
-    { optional: true },
-  );
-
-  // ─── BE3: Report Tools ───
-
-  api.registerTool(
-    () =>
-      ({
-        name: "sales_report",
-        label: "Sales Report",
-        description:
-          "Generate a sales report with revenue summary, top products, and daily trends.",
-        parameters: SalesReportSchema,
-        async execute(_toolCallId: string, params: SalesReportParams) {
-          log.info(`[wintent] sales_report: ${JSON.stringify(params)}`);
-          try {
-            const result = await generateSalesReport(params);
-            return json(result.data);
-          } catch (err) {
-            log.error(`[wintent] sales_report error: ${err}`);
-            return errorResult(
-              `Failed to generate sales report: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        },
-      }) as unknown as AnyAgentTool,
-    { optional: true },
-  );
-
-  api.registerTool(
-    () =>
-      ({
-        name: "business_overview",
-        label: "Business Overview",
-        description:
-          "Generate a comprehensive business overview including sales summary, inventory status, and key metrics.",
-        parameters: BusinessOverviewSchema,
-        async execute(_toolCallId: string) {
-          log.info("[wintent] business_overview");
-          try {
-            const result = await generateBusinessOverview();
-            return json(result.data);
-          } catch (err) {
-            log.error(`[wintent] business_overview error: ${err}`);
-            return errorResult(
-              `Failed to generate business overview: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        },
-      }) as unknown as AnyAgentTool,
-    { optional: true },
-  );
-
-  // ─── Confirm Action Tool (human-in-the-loop) ───
-
-  api.registerTool(
-    () =>
-      ({
-        name: "confirm_action",
-        label: "Confirm Action",
-        description:
-          "Ask the user to confirm or cancel an action before proceeding. Use this before destructive or important operations.",
-        parameters: ConfirmActionSchema,
-        async execute(_toolCallId: string, params: ConfirmActionParams) {
-          log.info(`[wintent] confirm_action: ${JSON.stringify(params)}`);
-          // This tool returns the params for the frontend ConfirmCard to render.
-          // The frontend will call addResult() with {confirmed: true/false}.
+        async execute(_toolCallId: string, params: Record<string, unknown>) {
+          log.info(`[wintent] create_scheduled_task: ${JSON.stringify(params)}`);
+          const result = await nbFetch<{ data: Record<string, unknown> }>(
+            "/api/scheduled_tasks:create",
+            {
+              method: "POST",
+              body: JSON.stringify({
+                name: params.name,
+                description: params.description || "",
+                cronExpression: params.cron_expression,
+                toolName: params.tool_name,
+                toolArgs: params.tool_args ? JSON.stringify(params.tool_args) : "{}",
+                enabled: params.enabled !== false,
+                status: "active",
+                lastRunAt: null,
+                nextRunAt: null,
+              }),
+            },
+          );
           return json({
-            action_description: params.action_description,
-            severity: params.severity || "info",
-            confirm_label: params.confirm_label || "确认",
-            cancel_label: params.cancel_label || "取消",
-            awaiting_confirmation: true,
+            success: true,
+            task: result.data,
+            message: `定时任务「${String(params.name)}」已创建，Cron: ${String(params.cron_expression)}`,
           });
         },
       }) as unknown as AnyAgentTool,
-    { optional: true },
   );
 
-  // ─── Phase 4: Kanban Tools ───
-
+  // ── list_scheduled_tasks ──
   api.registerTool(
     () =>
       ({
-        name: "show_kanban",
-        label: "Show Kanban Board",
+        name: "list_scheduled_tasks",
+        label: "List Scheduled Tasks",
         description:
-          "Show the kanban board with projects, plans, and tasks. Use this when the user asks to see project progress, task lists, or the kanban board.",
-        parameters: ShowKanbanSchema,
-        async execute(_toolCallId: string, params: ShowKanbanParams) {
-          log.info(`[wintent] show_kanban: ${JSON.stringify(params)}`);
-          try {
-            // Fetch projects
-            const projectsRes = await listKanbanProjects(params.project_id);
-            const projects = projectsRes.data || [];
-
-            // Build hierarchy: projects → plans → tasks
-            const result = [];
-            let totalTasks = 0,
-              pending = 0,
-              inProgress = 0,
-              completed = 0;
-
-            for (const project of projects) {
-              const plansRes = await listKanbanPlans(project.id, params.plan_id);
-              const plans = plansRes.data || [];
-
-              const planResults = [];
-              for (const plan of plans) {
-                const tasksRes = await listKanbanTasks(plan.id, params.status_filter);
-                const tasks = tasksRes.data || [];
-
-                for (const t of tasks) {
-                  totalTasks++;
-                  if (t.status === "pending") pending++;
-                  else if (t.status === "in_progress") inProgress++;
-                  else if (t.status === "completed") completed++;
-                }
-
-                planResults.push({
-                  id: plan.id,
-                  name: plan.name,
-                  description: plan.description,
-                  status: plan.status,
-                  tasks: tasks.map((t) => ({
-                    id: t.id,
-                    name: t.name,
-                    description: t.description,
-                    status: t.status,
-                    assignee: t.assignee,
-                    due_date: t.due_date,
-                    estimated_hours: t.estimated_hours,
-                  })),
-                });
-              }
-
-              result.push({
-                id: project.id,
-                name: project.name,
-                description: project.description,
-                status: project.status,
-                plans: planResults,
-              });
-            }
-
-            return json({
-              projects: result,
-              summary: {
-                total_tasks: totalTasks,
-                pending,
-                in_progress: inProgress,
-                completed,
-              },
-            });
-          } catch (err) {
-            log.error(`[wintent] show_kanban error: ${err}`);
-            return errorResult(
-              `Failed to load kanban: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
+          "List all scheduled/cron tasks with their status, cron expression, and last/next run times.",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            enabled_only: {
+              type: "boolean",
+              description: "Only show enabled tasks (default: false, shows all)",
+            },
+          },
+          required: [],
+        },
+        async execute(_toolCallId: string, params: Record<string, unknown>) {
+          log.info(`[wintent] list_scheduled_tasks: ${JSON.stringify(params)}`);
+          const filter = params.enabled_only ? '&filter={"enabled":true}' : "";
+          const result = await nbFetch<{
+            data: Array<Record<string, unknown>>;
+          }>(`/api/scheduled_tasks:list?pageSize=50&sort=-createdAt${filter}`);
+          return json({
+            tasks: (result.data || []).map((t) => ({
+              id: t.id,
+              name: t.name,
+              description: t.description,
+              cron_expression: t.cronExpression,
+              tool_name: t.toolName,
+              tool_args: t.toolArgs,
+              enabled: t.enabled,
+              status: t.status,
+              last_run_at: t.lastRunAt,
+              next_run_at: t.nextRunAt,
+            })),
+            total: result.data?.length ?? 0,
+          });
         },
       }) as unknown as AnyAgentTool,
-    { optional: true },
   );
 
+  // ── update_scheduled_task ──
   api.registerTool(
     () =>
       ({
-        name: "update_task_status",
-        label: "Update Task Status",
+        name: "update_scheduled_task",
+        label: "Update Scheduled Task",
         description:
-          "Update the status of a kanban task. Use this when the user wants to mark a task as in progress or completed.",
-        parameters: UpdateTaskStatusSchema,
-        async execute(_toolCallId: string, params: UpdateTaskStatusParams) {
-          log.info(`[wintent] update_task_status: ${JSON.stringify(params)}`);
-          try {
-            const result = await updateKanbanTaskStatus(params.task_id, params.new_status);
-            const statusLabels: Record<string, string> = {
-              pending: "待处理",
-              in_progress: "进行中",
-              completed: "已完成",
-            };
-            return json({
-              success: true,
-              task: result.data,
-              message: `任务已更新为「${statusLabels[params.new_status] || params.new_status}」`,
-            });
-          } catch (err) {
-            log.error(`[wintent] update_task_status error: ${err}`);
-            return errorResult(
-              `Failed to update task: ${err instanceof Error ? err.message : String(err)}`,
-            );
+          "Update a scheduled task. Can enable/disable, change cron expression, or modify the tool to execute.",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            task_id: { type: "integer", description: "ID of the task to update" },
+            name: { type: "string", description: "New name" },
+            cron_expression: { type: "string", description: "New cron expression" },
+            tool_name: { type: "string", description: "New tool to execute" },
+            tool_args: { type: "object", description: "New tool arguments" },
+            enabled: { type: "boolean", description: "Enable or disable the task" },
+          },
+          required: ["task_id"],
+        },
+        async execute(_toolCallId: string, params: Record<string, unknown>) {
+          log.info(`[wintent] update_scheduled_task: ${JSON.stringify(params)}`);
+          const updateData: Record<string, unknown> = {};
+          if (params.name !== undefined) {
+            updateData.name = params.name;
           }
+          if (params.cron_expression !== undefined) {
+            updateData.cronExpression = params.cron_expression;
+          }
+          if (params.tool_name !== undefined) {
+            updateData.toolName = params.tool_name;
+          }
+          if (params.tool_args !== undefined) {
+            updateData.toolArgs = JSON.stringify(params.tool_args);
+          }
+          if (params.enabled !== undefined) {
+            updateData.enabled = params.enabled;
+          }
+
+          const result = await nbFetch<{ data: Record<string, unknown> }>(
+            `/api/scheduled_tasks:update?filterByTk=${String(params.task_id)}`,
+            {
+              method: "POST",
+              body: JSON.stringify(updateData),
+            },
+          );
+          return json({ success: true, task: result.data });
         },
       }) as unknown as AnyAgentTool,
-    { optional: true },
   );
 
-  // ─── Phase 4: Methodology Tools ───
-
+  // ── delete_scheduled_task ──
   api.registerTool(
     () =>
       ({
-        name: "list_methodologies",
-        label: "List Methodology Templates",
-        description:
-          "List available methodology templates for business operations. Use this when the user asks about methodologies, business processes, or operational guides.",
-        parameters: ListMethodologiesSchema,
-        async execute(_toolCallId: string, params: ListMethodologiesParams) {
-          log.info(`[wintent] list_methodologies: ${JSON.stringify(params)}`);
-          try {
-            const result = await listMethodologyTemplates(params);
-            const templates = result.data || [];
-            return json({
-              templates: templates.map((t) => ({
-                id: t.id,
-                name: t.name,
-                category: t.category,
-                industry: t.industry,
-                description: t.description,
-                icon: t.icon,
-                steps: t.steps || [],
-                trigger_words: t.trigger_words,
-              })),
-              total: templates.length,
-            });
-          } catch (err) {
-            log.error(`[wintent] list_methodologies error: ${err}`);
-            return errorResult(
-              `Failed to list methodologies: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
+        name: "delete_scheduled_task",
+        label: "Delete Scheduled Task",
+        description: "Delete a scheduled task by ID.",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            task_id: { type: "integer", description: "ID of the task to delete" },
+          },
+          required: ["task_id"],
+        },
+        async execute(_toolCallId: string, params: Record<string, unknown>) {
+          log.info(`[wintent] delete_scheduled_task: ${JSON.stringify(params)}`);
+          await nbFetch(`/api/scheduled_tasks:destroy?filterByTk=${String(params.task_id)}`, {
+            method: "POST",
+          });
+          return json({ success: true, message: "定时任务已删除" });
         },
       }) as unknown as AnyAgentTool,
-    { optional: true },
   );
 
-  api.registerTool(
-    () =>
-      ({
-        name: "show_methodology",
-        label: "Show Methodology Template",
-        description:
-          "Show a specific methodology template with detailed steps, checklists, and expected outputs. Use this when the user wants to follow a specific methodology or asks about a business process like '新店开业', '换季上新', 'VIP客户维护'.",
-        parameters: ShowMethodologySchema,
-        async execute(_toolCallId: string, params: ShowMethodologyParams) {
-          log.info(`[wintent] show_methodology: ${JSON.stringify(params)}`);
-          try {
-            const result = await getMethodologyTemplate({
-              id: params.template_id,
-              name: params.template_name,
-            });
-            return json({
-              template: {
-                id: result.data.id,
-                name: result.data.name,
-                category: result.data.category,
-                industry: result.data.industry,
-                description: result.data.description,
-                icon: result.data.icon,
-                steps: result.data.steps || [],
-              },
-            });
-          } catch (err) {
-            log.error(`[wintent] show_methodology error: ${err}`);
-            return errorResult(
-              `Failed to show methodology: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        },
-      }) as unknown as AnyAgentTool,
-    { optional: true },
-  );
-
-  log.info("[wintent] Wintent clothing store tools registered (11 tools)");
+  log.info("[wintent] 4 cron/scheduling tools registered (server-side).");
 }
