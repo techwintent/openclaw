@@ -251,4 +251,135 @@ export default function register(api: OpenClawPluginApi) {
   );
 
   log.info("[wintent] 4 cron/scheduling tools registered (server-side).");
+
+  // ─── File Parsing Tool (workspace pipeline) ───
+  // Reads files from the shared /workspace volume and returns parsed content.
+  // Excel → CSV text, CSV → raw text, images → metadata, others → raw text preview.
+
+  const WORKSPACE_DIR = process.env.WORKSPACE_DIR || "/home/node/.openclaw/workspace";
+
+  api.registerTool(
+    () =>
+      ({
+        name: "parse_file",
+        label: "Parse File",
+        description:
+          "Parse a file from the workspace and return its content as text. Supports Excel (.xlsx/.xls → CSV), CSV, and text files. For images, returns file metadata. Use this when the user has uploaded a file and you need to read its content.",
+        parameters: {
+          type: "object" as const,
+          properties: {
+            path: {
+              type: "string",
+              description:
+                "Relative path of the file in the workspace (e.g. 'uploads/abc_data.xlsx')",
+            },
+          },
+          required: ["path"],
+        },
+        async execute(_toolCallId: string, params: Record<string, unknown>) {
+          const filePath = typeof params.path === "string" ? params.path : "";
+          log.info(`[wintent] parse_file: ${filePath}`);
+
+          if (!filePath) {
+            return json({ error: "Missing required parameter: path" });
+          }
+
+          // Security: prevent path traversal
+          const { resolve, join, basename } = await import("node:path");
+          const fullPath = resolve(join(WORKSPACE_DIR, filePath));
+          if (!fullPath.startsWith(resolve(WORKSPACE_DIR))) {
+            return json({ error: "Path traversal not allowed" });
+          }
+
+          const { readFile, stat } = await import("node:fs/promises");
+
+          try {
+            const fileStat = await stat(fullPath);
+            const ext = basename(fullPath).toLowerCase().split(".").pop() || "";
+
+            // Excel files → CSV conversion
+            if (["xlsx", "xls"].includes(ext)) {
+              try {
+                const XLSX = await import("xlsx");
+                const workbook = XLSX.read(await readFile(fullPath));
+                const sheets: string[] = [];
+                for (const sheetName of workbook.SheetNames) {
+                  const sheet = workbook.Sheets[sheetName];
+                  const csv = XLSX.utils.sheet_to_csv(sheet);
+                  sheets.push(`--- Sheet: ${sheetName} ---\n${csv}`);
+                }
+                return json({
+                  filename: basename(fullPath),
+                  type: "excel",
+                  size: fileStat.size,
+                  content: sheets.join("\n\n"),
+                });
+              } catch (xlsErr) {
+                return json({
+                  error: `Failed to parse Excel: ${String(xlsErr)}`,
+                  filename: basename(fullPath),
+                });
+              }
+            }
+
+            // Image files → metadata only.
+            // Visual analysis is currently UNAVAILABLE (no vision provider configured).
+            // The AI must NOT fabricate image content — it should ask the user to describe it.
+            if (["jpg", "jpeg", "png", "gif", "webp"].includes(ext)) {
+              return json({
+                filename: basename(fullPath),
+                type: "image",
+                size: fileStat.size,
+                mimetype: `image/${ext === "jpg" ? "jpeg" : ext}`,
+                vision_available: false,
+                limitation:
+                  "图片视觉分析当前不可用。请告知用户：暂时无法识别图片内容，请用文字描述图片中的商品、单据或关键信息。不要编造图片内容。",
+              });
+            }
+
+            // CSV and text files → raw content (cap at PARSE_FILE_READ_LIMIT).
+            // For oversized files we stream the first N bytes rather than
+            // reading the whole file into memory and slicing afterwards.
+            const PARSE_FILE_READ_LIMIT = 100 * 1024;
+            if (fileStat.size > PARSE_FILE_READ_LIMIT) {
+              const { createReadStream } = await import("node:fs");
+              const stream = createReadStream(fullPath, {
+                encoding: "utf-8",
+                start: 0,
+                end: PARSE_FILE_READ_LIMIT - 1,
+              });
+              let partial = "";
+              for await (const chunk of stream) {
+                partial += chunk as string;
+                if (partial.length >= PARSE_FILE_READ_LIMIT) {
+                  break;
+                }
+              }
+              return json({
+                filename: basename(fullPath),
+                type: "text",
+                size: fileStat.size,
+                truncated: true,
+                content: partial.slice(0, PARSE_FILE_READ_LIMIT),
+              });
+            }
+
+            const content = await readFile(fullPath, "utf-8");
+            return json({
+              filename: basename(fullPath),
+              type: ext === "csv" ? "csv" : "text",
+              size: fileStat.size,
+              content,
+            });
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+              return json({ error: `File not found: ${filePath}` });
+            }
+            return json({ error: `Failed to read file: ${String(err)}` });
+          }
+        },
+      }) as unknown as AnyAgentTool,
+  );
+
+  log.info("[wintent] parse_file tool registered (workspace pipeline).");
 }

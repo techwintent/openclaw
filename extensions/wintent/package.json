@@ -5,7 +5,8 @@
   "description": "OpenClaw Wintent clothing store tools — sales, inventory, reports via NocoBase",
   "type": "module",
   "dependencies": {
-    "@sinclair/typebox": "0.34.48"
+    "@sinclair/typebox": "0.34.48",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "openclaw": {
     "extensions": [
