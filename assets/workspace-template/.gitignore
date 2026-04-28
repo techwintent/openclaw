@@ -1,0 +1,8 @@
+.DS_Store
+.openclaw/
+*.bak
+*.tmp
+*.swp
+memory/.git/
+memory/.dreams/
+state/*.tmp
